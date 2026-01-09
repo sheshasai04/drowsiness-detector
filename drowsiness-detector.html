@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SafeDrive - Advanced HUD</title>
+    
+    <!-- External AI & Drawing Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils"></script>
+
+    <style>
+        body {
+            font-family: 'Orbitron', 'Segoe UI', sans-serif;
+            background-color: #050505;
+            color: #00d4ff;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        .container {
+            position: relative;
+            text-align: center;
+            background: rgba(16, 33, 62, 0.8);
+            padding: 30px;
+            border-radius: 30px;
+            border: 1px solid #00d4ff;
+            box-shadow: 0 0 20px rgba(0, 212, 255, 0.2);
+        }
+
+        #video-container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            background: #000;
+            border-radius: 15px;
+            overflow: hidden;
+            margin-bottom: 20px;
+            border: 2px solid #333;
+        }
+
+        video, canvas {
+            position: absolute;
+            left: 0;
+            top: 0;
+            transform: scaleX(-1);
+        }
+
+        #alert-box {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(255, 0, 0, 0.4);
+            backdrop-filter: blur(5px);
+            color: white;
+            font-size: 5rem;
+            font-weight: bold;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            pointer-events: none;
+            animation: pulse-red 0.5s infinite alternate;
+        }
+
+        @keyframes pulse-red {
+            from { background: rgba(255, 0, 0, 0.2); }
+            to { background: rgba(255, 0, 0, 0.6); }
+        }
+
+        .status-panel {
+            padding: 20px;
+            background: rgba(15, 52, 96, 0.9);
+            border-radius: 15px;
+            width: 100%;
+            max-width: 450px;
+            border-left: 5px solid #00d4ff;
+        }
+
+        .status-text {
+            font-size: 1.1rem;
+            margin: 8px 0;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        #start-btn {
+            background: #00d4ff;
+            color: #050505;
+            border: none;
+            padding: 15px 40px;
+            font-size: 1rem;
+            font-weight: bold;
+            border-radius: 50px;
+            cursor: pointer;
+            margin-top: 15px;
+            transition: all 0.3s;
+            box-shadow: 0 0 15px rgba(0, 212, 255, 0.5);
+        }
+
+        #start-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 0 25px rgba(0, 212, 255, 0.8);
+        }
+
+        .loading-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: #000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 10;
+        }
+
+        #error-msg {
+            color: #ff4d4d;
+            font-size: 0.9rem;
+            margin-top: 10px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1 style="margin-top:0;">SYSTEM HUD: <span id="mode-text">SCANNING</span></h1>
+
+        <div id="video-container">
+            <div id="loading" class="loading-overlay">
+                <p>INITIALIZING BIOMETRIC SCANNER...</p>
+                <p style="font-size: 0.8rem;">Please ensure camera access is allowed</p>
+            </div>
+            
+            <video id="input_video" width="640px" height="480px" playsinline></video>
+            <canvas id="output_canvas" width="640px" height="480px"></canvas>
+        </div>
+
+        <div class="status-panel">
+            <div id="eye-status" class="status-text">SIGNAL: OFFLINE</div>
+            <div id="timer-text" class="status-text">EYE_LATENCY: 0.0s</div>
+            <button id="start-btn">INITIALIZE CORE & CAMERA</button>
+            <div id="error-msg">Error: Camera access denied. Please click the camera icon in the address bar and allow access.</div>
+        </div>
+    </div>
+
+    <div id="alert-box" style="display:none;">
+        <div>WARNING</div>
+        <div style="font-size: 1.5rem;">DROWSINESS DETECTED</div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const alertBox = document.getElementById('alert-box');
+        const eyeStatusText = document.getElementById('eye-status');
+        const timerText = document.getElementById('timer-text');
+        const loadingOverlay = document.getElementById('loading');
+        const startBtn = document.getElementById('start-btn');
+        const modeText = document.getElementById('mode-text');
+        const errorMsg = document.getElementById('error-msg');
+
+        let eyesClosedStartTime = null;
+        const ALERT_THRESHOLD = 2.0; 
+        let audioEnabled = false;
+        let audioCtx;
+        let camera = null;
+
+        // Function to start camera and audio
+        async function initializeApp() {
+            try {
+                errorMsg.style.display = 'none';
+                
+                // Unlock Audio
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                audioEnabled = true;
+
+                // Attempt to start Camera
+                camera = new Camera(videoElement, {
+                    onFrame: async () => {
+                        await faceMesh.send({image: videoElement});
+                    },
+                    width: 640,
+                    height: 480
+                });
+
+                await camera.start();
+                
+                startBtn.style.display = 'none';
+                eyeStatusText.innerText = "SIGNAL: ACTIVE";
+            } catch (err) {
+                console.error("Initialization Error:", err);
+                errorMsg.style.display = 'block';
+                if (err.name === 'NotAllowedError') {
+                    errorMsg.innerText = "CRITICAL: Camera access denied. Please enable camera in browser settings.";
+                } else {
+                    errorMsg.innerText = "CRITICAL: Could not start camera. Check if another app is using it.";
+                }
+            }
+        }
+
+        startBtn.addEventListener('click', initializeApp);
+
+        function playAlarmSound() {
+            if (!audioEnabled || !audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(110, audioCtx.currentTime + 0.1);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.15);
+        }
+
+        function onResults(results) {
+            loadingOverlay.style.display = 'none';
+            
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                const face = results.multiFaceLandmarks[0];
+                
+                const leftDist = Math.abs(face[159].y - face[145].y);
+                const rightDist = Math.abs(face[386].y - face[374].y);
+                const areEyesClosed = (leftDist < 0.015 && rightDist < 0.015);
+
+                const hudColor = areEyesClosed ? '#ff0000' : '#00d4ff';
+                
+                drawConnectors(canvasCtx, face, FACEMESH_TESSELATION, 
+                    {color: hudColor, lineWidth: 0.5});
+                
+                const eyePoints = [159, 386];
+                eyePoints.forEach(idx => {
+                    const point = face[idx];
+                    canvasCtx.beginPath();
+                    canvasCtx.arc(point.x * canvasElement.width, point.y * canvasElement.height, 15, 0, 2 * Math.PI);
+                    canvasCtx.strokeStyle = hudColor;
+                    canvasCtx.lineWidth = 2;
+                    canvasCtx.stroke();
+                });
+
+                if (areEyesClosed) {
+                    if (!eyesClosedStartTime) eyesClosedStartTime = Date.now();
+                    const duration = (Date.now() - eyesClosedStartTime) / 1000;
+                    
+                    eyeStatusText.innerText = "SIGNAL: CRITICAL";
+                    eyeStatusText.style.color = "#ff0000";
+                    timerText.innerText = `EYE_LATENCY: ${duration.toFixed(1)}s`;
+                    modeText.innerText = "DANGER";
+                    modeText.style.color = "#ff0000";
+
+                    if (duration >= ALERT_THRESHOLD) {
+                        alertBox.style.display = 'flex';
+                        playAlarmSound();
+                    }
+                } else {
+                    eyesClosedStartTime = null;
+                    alertBox.style.display = 'none';
+                    if (audioEnabled) {
+                        eyeStatusText.innerText = "SIGNAL: STABLE";
+                        eyeStatusText.style.color = "#00d4ff";
+                        modeText.innerText = "SCANNING";
+                        modeText.style.color = "#00d4ff";
+                    }
+                    timerText.innerText = `EYE_LATENCY: 0.0s`;
+                }
+            } else {
+                eyeStatusText.innerText = "SIGNAL: LOST";
+                eyeStatusText.style.color = "#888";
+                eyesClosedStartTime = null;
+                alertBox.style.display = 'none';
+            }
+            canvasCtx.restore();
+        }
+
+        const faceMesh = new FaceMesh({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+        });
+
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            refineLandmarks: true,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        faceMesh.onResults(onResults);
+    </script>
+</body>
+</html>
